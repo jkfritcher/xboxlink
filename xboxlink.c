@@ -1,20 +1,22 @@
 
 #include <sys/types.h>
+#include <errno.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <strings.h>
 #include <unistd.h>
 
 #include <pthread.h>
 
+#include <sys/capability.h>
 #include <pcap/pcap.h>
 
 typedef struct {
     char *interface;
-    char *filter;
     int idx;
-    char out;
 
     pthread_t thread;
     pcap_t *pcap;
@@ -25,58 +27,53 @@ typedef struct {
     uint32_t pkts_sent;
 } xbl_interface_t;
 
-xbl_interface_t **interfaces;
-pthread_mutex_t pcap_compile_lock = PTHREAD_MUTEX_INITIALIZER;
+const uint8_t MAX_NUM_INTERFACES = 4;
+
+struct bpf_program xbl_bpf_filter;
+xbl_interface_t **xbl_interfaces;
+bool debug;
+
+
+void usage(void)
+{
+    fprintf(stderr, "foobarbaz\n");
+}
 
 void handler(uint8_t *user, const struct pcap_pkthdr *h, const uint8_t *packet)
 {
     xbl_interface_t *xit = (xbl_interface_t *)user;
-    int rv;
-    //putchar(xit->out);
 
-    xit->pkts_rcvd += 1;
     xit->bytes_rcvd += h->caplen;
+    xit->pkts_rcvd++;
 
-    xbl_interface_t *xit_out = (xit->idx == 0) ? interfaces[1] : interfaces[0];
-    rv = pcap_inject(xit_out->pcap, packet, h->caplen);
+    xbl_interface_t *xit_out = (xit->idx == 0) ? xbl_interfaces[1] : xbl_interfaces[0];
+    int rv = pcap_inject(xit_out->pcap, packet, h->caplen);
     if (rv == -1) {
         fprintf(stderr, "pcap_inject failed: %s\n", pcap_geterr(xit_out->pcap));
         return;
     }
 
-    xit_out->pkts_sent += 1;
     xit_out->bytes_sent += rv;
+    xit_out->pkts_sent++;
 }
 
-int xbl_pcap_init(xbl_interface_t *xit)
+bool xbl_pcap_init(xbl_interface_t *xit)
 {
     char errbuf[PCAP_ERRBUF_SIZE];
-
-    struct bpf_program fp;
     int rv;
 
-    xit->pcap = pcap_open_live(xit->interface, 65535, 1, 1000, errbuf);
+    xit->pcap = pcap_open_live(xit->interface, 65535, 1, 0, errbuf);
     if (xit->pcap == NULL) {
         fprintf(stderr, "pcap_open_live failed: %s\n", errbuf);
-        return 0;
+        return false;
     }
 
-    pthread_mutex_lock(&pcap_compile_lock);
-    rv = pcap_compile(xit->pcap, &fp, xit->filter, 1, PCAP_NETMASK_UNKNOWN);
-    pthread_mutex_unlock(&pcap_compile_lock);
-    if (rv == -1) {
-        fprintf(stderr, "pcap_compile failed: %s\n", pcap_geterr(xit->pcap));
-        pcap_close(xit->pcap);
-        xit->pcap = NULL;
-        return 0;
-    }
-
-    rv = pcap_setfilter(xit->pcap, &fp);
+    rv = pcap_setfilter(xit->pcap, &xbl_bpf_filter);
     if (rv == -1) {
         fprintf(stderr, "pcap_setfilter failed: %s\n", pcap_geterr(xit->pcap));
         pcap_close(xit->pcap);
         xit->pcap = NULL;
-        return 0;
+        return false;
     }
 
     rv = pcap_setdirection(xit->pcap, PCAP_D_IN);
@@ -84,10 +81,10 @@ int xbl_pcap_init(xbl_interface_t *xit)
         fprintf(stderr, "pcap_setdirection failed: %s\n", pcap_geterr(xit->pcap));
         pcap_close(xit->pcap);
         xit->pcap = NULL;
-        return 0;
+        return false;
     }
 
-    return 1;
+    return true;
 }
 
 void *pcap_runner(void *arg)
@@ -106,32 +103,110 @@ void *pcap_runner(void *arg)
     return NULL;
 }
 
+static
+bool validate_interface_name(const char *int_name)
+{
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *p = pcap_open_live(int_name, 65535, 0, 0, errbuf);
+    if (p == NULL)
+        return 1;
+
+    pcap_close(p);
+    return 0;
+}
+
+static
+bool check_capabilities(void)
+{
+    cap_flag_value_t cap_val;
+    cap_t caps = cap_get_proc();
+    cap_get_flag(caps, CAP_NET_RAW, CAP_EFFECTIVE, &cap_val);
+    cap_free(caps);
+
+    return (cap_val == CAP_SET);
+}
+
+static
+bool prepare_bpf_filter(void)
+{
+    pcap_t *p = pcap_open_dead(DLT_EN10MB, 65535);
+    if (p == NULL) {
+        fprintf(stderr, "pcap_open_dead() failed.");
+        return false;
+    }
+    int rv = pcap_compile(p, &xbl_bpf_filter, "host 0.0.0.1", 1, PCAP_NETMASK_UNKNOWN);
+    if (rv < 0) {
+        fprintf(stderr, "pcap_compile() failed: %s\n", pcap_geterr(p));
+    }
+    pcap_close(p);
+
+    return (rv == 0);
+}
+
 int main(int argc, char *argv[])
 {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    if (!check_capabilities()) {
+        fprintf(stderr, "This program must be run as root, or be granted the CAP_NET_RAW capability\n");
+        exit(-1);
+    }
 
-    interfaces = malloc(sizeof(xbl_interface_t*) * 3);
-    bzero(interfaces, sizeof(xbl_interface_t*) * 3);
-    interfaces[0] = malloc(sizeof(xbl_interface_t));
-    interfaces[1] = malloc(sizeof(xbl_interface_t));
-    bzero(interfaces[0], sizeof(xbl_interface_t));
-    bzero(interfaces[1], sizeof(xbl_interface_t));
+    char *interfaces[MAX_NUM_INTERFACES];
+    bzero(interfaces, sizeof(char *) * MAX_NUM_INTERFACES);
+    uint8_t num_interfaces = 0;
 
-    xbl_interface_t *i1 = interfaces[0], *i2 = interfaces[1];
-    i1->interface = "eth0";
-    i1->filter = "host 0.0.0.1";
-    i1->idx = 0;
-    i1->out = '.';
-    i2->interface = "eth2";
-    i2->filter = "host 0.0.0.1";
-    i2->idx = 1;
-    i2->out = '*';
+    int ch;
+    while((ch = getopt(argc, argv, "dhi:")) != -1) {
+        switch(ch) {
+            case 'd':
+                debug = true;
+                break;
+            case 'i':
+                if (num_interfaces >= MAX_NUM_INTERFACES) {
+                    fprintf(stderr, "Too many interfaces specified, maximum is %d.\n", MAX_NUM_INTERFACES);
+                    exit(-1);
+                }
+                if (validate_interface_name(optarg) != 0) {
+                    fprintf(stderr, "%s does not appear to be a valid interface name.\n", optarg);
+                    exit(-1);
+                }
+                interfaces[num_interfaces] = optarg;
+                num_interfaces++;
+                break;
+            case 'h':
+            default:
+                usage();
+                exit(-1);
+        }
+    }
 
-    pthread_create(&i1->thread, NULL, pcap_runner, i1);
-    pthread_create(&i2->thread, NULL, pcap_runner, i2);
+    if (!prepare_bpf_filter()) {
+        fprintf(stderr, "Failed to compile bpf filter.\n");
+        exit(-1);
+    }
 
-    pthread_join(i1->thread, NULL);    
-    pthread_join(i2->thread, NULL);    
+    xbl_interfaces = malloc(sizeof(xbl_interface_t *) * (num_interfaces + 1));
+    if (xbl_interfaces == NULL) {
+        fprintf(stderr, "malloc() failed while allocating interfaces array: %s\n", strerror(errno));
+        exit(-1);
+    }
+    bzero(xbl_interfaces, sizeof(xbl_interface_t *) * (num_interfaces + 1));
+    for (int i = 0; i < num_interfaces; i++) {
+        xbl_interfaces[i] = malloc(sizeof(xbl_interface_t));
+        if (xbl_interfaces[i] == NULL) {
+            fprintf(stderr, "malloc() failed while allocating xbl_interface struct: %s\n", strerror(errno));
+            exit(-1);
+        }
+        bzero(xbl_interfaces[i], sizeof(xbl_interface_t));
+
+        xbl_interfaces[i]->interface = interfaces[i];
+        xbl_interfaces[i]->idx = i;
+
+        pthread_create(&xbl_interfaces[i]->thread, NULL, pcap_runner, xbl_interfaces[i]);
+    }
+
+    for (int i = 0; i < num_interfaces; i++) {
+        pthread_join(xbl_interfaces[i]->thread, NULL);    
+    }
 
     return 0;
 }
