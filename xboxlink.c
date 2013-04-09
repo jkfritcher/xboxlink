@@ -1,4 +1,6 @@
 
+#include <net/ethernet.h>
+
 #include <sys/capability.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -14,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <pcap/pcap.h>
@@ -27,11 +30,24 @@ typedef struct {
     pthread_t thread;
     pcap_t *pcap;
 
+    pthread_mutex_t stats_lock;
     uint64_t bytes_rcvd;
     uint64_t bytes_sent;
     uint32_t pkts_rcvd;
     uint32_t pkts_sent;
 } xbl_interface_t;
+
+typedef struct {
+    uint8_t mac_addr[ETHER_ADDR_LEN];
+    xbl_interface_t *interface;
+    time_t last_seen;
+
+    pthread_mutex_t stats_lock;
+    uint64_t bytes_rcvd;
+    uint64_t bytes_sent;
+    uint32_t pkts_rcvd;
+    uint32_t pkts_sent;
+} xbl_host_t;
 
 const uint8_t MAX_NUM_INTERFACES = 4;
 
@@ -46,22 +62,93 @@ void usage(void)
     fputs("foobarbaz\n", stderr);
 }
 
+void update_host_recv_stats(xbl_host_t *xht, uint32_t pkt_len)
+{
+    pthread_mutex_lock(&xht->stats_lock);
+    xht->bytes_rcvd += pkt_len;
+    xht->pkts_rcvd++;
+    pthread_mutex_unlock(&xht->stats_lock);
+}
+
+void update_host_send_stats(xbl_host_t *xht, uint32_t pkt_len)
+{
+    pthread_mutex_lock(&xht->stats_lock);
+    xht->bytes_rcvd += pkt_len;
+    xht->pkts_rcvd++;
+    pthread_mutex_unlock(&xht->stats_lock);
+}
+
+void update_interface_recv_stats(xbl_interface_t *xit, uint32_t pkt_len)
+{
+    pthread_mutex_lock(&xit->stats_lock);
+    xit->bytes_rcvd += pkt_len;
+    xit->pkts_rcvd++;
+    pthread_mutex_unlock(&xit->stats_lock);
+}
+
+void update_interface_send_stats(xbl_interface_t *xit, uint32_t pkt_len)
+{
+    pthread_mutex_lock(&xit->stats_lock);
+    xit->bytes_sent += pkt_len;
+    xit->pkts_sent++;
+    pthread_mutex_unlock(&xit->stats_lock);
+}
+
+xbl_host_t *get_host_by_dest_addr(uint8_t *addr)
+{
+    return NULL;
+}
+
+xbl_host_t *get_host_by_source_addr(uint8_t *addr, xbl_interface_t *in)
+{
+    return NULL;
+}
+
 void handler(uint8_t *user, const struct pcap_pkthdr *h, const uint8_t *packet)
 {
-    xbl_interface_t *xit = (xbl_interface_t *)user;
+    xbl_interface_t *xit_in = (xbl_interface_t *)user;
+    struct ether_header *eth_hdr = (struct ether_header *)packet;
 
-    xit->bytes_rcvd += h->caplen;
-    xit->pkts_rcvd++;
+    update_interface_recv_stats(xit_in, h->caplen);
 
-    xbl_interface_t *xit_out = (xit->idx == 0) ? xbl_interfaces[1] : xbl_interfaces[0];
-    int rv = pcap_inject(xit_out->pcap, packet, h->caplen);
-    if (rv == -1) {
-        log_msg("pcap_inject failed: %s", pcap_geterr(xit_out->pcap));
+    xbl_host_t *src_host = get_host_by_source_addr(eth_hdr->ether_shost, xit_in);
+    if (src_host == NULL) {
+        log_msg("Failed to lookup source host struct.");
         return;
     }
+    update_host_recv_stats(src_host, h->caplen);
 
-    xit_out->bytes_sent += rv;
-    xit_out->pkts_sent++;
+    if (memcmp(eth_hdr->ether_dhost, "\xff\xff\xff\xff\xff\xff", 6) != 0) {
+        /* Unicast packet */
+        xbl_host_t *dst_host = get_host_by_dest_addr(eth_hdr->ether_dhost);
+        if (dst_host == NULL) {
+            log_msg("Failed to lookup destination host struct.");
+            return;
+        }
+        xbl_interface_t *xit_out = dst_host->interface;
+        if (xit_out == xit_in)
+            return;
+        int rv = pcap_inject(xit_out->pcap, packet, h->caplen);
+        if (rv == -1) {
+            log_msg("pcap_inject failed: %s", pcap_geterr(xit_out->pcap));
+            return;
+        }
+        update_host_send_stats(dst_host, rv);
+        update_interface_send_stats(xit_out, rv);
+    } else {
+        /* Broadcast packet */
+        for(int i = 0; i < MAX_NUM_INTERFACES && xbl_interfaces[i] != NULL; i++) {
+            xbl_interface_t *xit_out = xbl_interfaces[i];
+            if (xit_out == xit_in)
+                continue;
+            int rv = pcap_inject(xit_out->pcap, packet, h->caplen);
+            if (rv == -1) {
+                log_msg("pcap_inject failed: %s", pcap_geterr(xit_out->pcap));
+                return;
+            }
+            update_interface_send_stats(xit_out, rv);
+        }
+    }
 }
 
 bool xbl_pcap_init(xbl_interface_t *xit)
@@ -221,9 +308,10 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (!debug) {
+    if (!debug)
         daemonize();
-    }
+
+    log_open(NULL, LOG_NDELAY|LOG_PID, LOG_USER);
 
     if (!prepare_bpf_filter())
         log_quit("Failed to compile bpf filter.");
