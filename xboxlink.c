@@ -17,6 +17,7 @@
 #include <string.h>
 #include <strings.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <pcap/pcap.h>
@@ -49,10 +50,22 @@ typedef struct {
     uint32_t pkts_sent;
 } xbl_host_t;
 
+typedef struct hash_node_s {
+    struct hash_node_s *next;
+    xbl_host_t *host;
+} hash_node_t;
+
+typedef struct {
+    pthread_mutex_t lock;
+    hash_node_t *hosts[31];
+} xbl_hash_t;
+
+
 const uint8_t MAX_NUM_INTERFACES = 4;
 
 struct bpf_program xbl_bpf_filter;
 xbl_interface_t **xbl_interfaces;
+xbl_hash_t host_hash;
 
 int  log_to_stderr;
 bool debug;
@@ -94,14 +107,62 @@ void update_interface_send_stats(xbl_interface_t *xit, uint32_t pkt_len)
     pthread_mutex_unlock(&xit->stats_lock);
 }
 
+xbl_host_t *get_host_by_addr(uint8_t *addr, bool create, xbl_interface_t *in)
+{
+    uint64_t iaddr = ((uint64_t)addr[0]) << 40 | ((uint64_t)addr[1]) << 32 |
+                     ((uint64_t)addr[2]) << 24 | ((uint64_t)addr[3]) << 16 |
+                     ((uint64_t)addr[4]) <<  8 | ((uint64_t)addr[5]);
+    uint8_t idx = iaddr % 31;
+
+    xbl_host_t *h = NULL;
+    pthread_mutex_lock(&host_hash.lock);
+    for (hash_node_t *n = host_hash.hosts[idx]; n != NULL; n = n->next) {
+        if (memcmp(addr, n->host->mac_addr, 6) == 0)
+            h = n->host;
+            break;
+    }
+
+    if (h == NULL && create == true) {
+        h = malloc(sizeof(xbl_host_t));
+        if (h != NULL) {
+            bzero(h, sizeof(xbl_host_t));
+            memcpy(h->mac_addr, addr, 6);
+
+            hash_node_t *n = malloc(sizeof(hash_node_t));
+            if (n != NULL) {
+                bzero(n, sizeof(hash_node_t));
+                n->host = h;
+                if (host_hash.hosts[idx] != NULL) {
+                    n->next = host_hash.hosts[idx];
+                }
+                host_hash.hosts[idx] = n;
+            } else {
+                log_ret("Failed to allocate xbl_node_t");
+                free(h);
+                h = NULL;
+            }
+        } else {
+            log_ret("Failed to allocate xbl_host_t");
+        }
+    }
+    pthread_mutex_unlock(&host_hash.lock);
+
+    if (h != NULL && in != NULL) {
+        if (h->interface != in)
+            h->interface = in;
+    }
+
+    return h;
+}
+
 xbl_host_t *get_host_by_dest_addr(uint8_t *addr)
 {
-    return NULL;
+    return get_host_by_addr(addr, false, NULL);
 }
 
 xbl_host_t *get_host_by_source_addr(uint8_t *addr, xbl_interface_t *in)
 {
-    return NULL;
+    return get_host_by_addr(addr, true, in);
 }
 
 void handler(uint8_t *user, const struct pcap_pkthdr *h, const uint8_t *packet)
@@ -117,6 +178,7 @@ void handler(uint8_t *user, const struct pcap_pkthdr *h, const uint8_t *packet)
         return;
     }
     update_host_recv_stats(src_host, h->caplen);
+    src_host->last_seen = time(NULL);
 
     if (memcmp(eth_hdr->ether_dhost, "\xff\xff\xff\xff\xff\xff", 6) != 0) {
         /* Unicast packet */
