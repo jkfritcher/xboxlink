@@ -38,7 +38,8 @@ typedef struct {
     uint32_t pkts_sent;
 } xbl_interface_t;
 
-typedef struct {
+typedef struct xbl_host_s {
+    struct xbl_host_s *next;
     uint8_t mac_addr[ETHER_ADDR_LEN];
     xbl_interface_t *interface;
     time_t last_seen;
@@ -50,14 +51,9 @@ typedef struct {
     uint32_t pkts_sent;
 } xbl_host_t;
 
-typedef struct hash_node_s {
-    struct hash_node_s *next;
-    xbl_host_t *host;
-} hash_node_t;
-
 typedef struct {
     pthread_mutex_t lock;
-    hash_node_t *hosts[31];
+    xbl_host_t *hosts[31];
 } xbl_hash_t;
 
 
@@ -107,6 +103,15 @@ void update_interface_send_stats(xbl_interface_t *xit, uint32_t pkt_len)
     pthread_mutex_unlock(&xit->stats_lock);
 }
 
+pthread_mutex_t format_mac_lock = PTHREAD_MUTEX_INITIALIZER;
+char *format_mac_address(uint8_t *address)
+{
+    static char txt_addr[18];
+    snprintf(txt_addr, sizeof(txt_addr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             address[0], address[1], address[2], address[3], address[4], address[5]);
+    return txt_addr;
+}
+
 xbl_host_t *get_host_by_addr(uint8_t *addr, bool create, xbl_interface_t *in)
 {
     uint64_t iaddr = ((uint64_t)addr[0]) << 40 | ((uint64_t)addr[1]) << 32 |
@@ -116,9 +121,9 @@ xbl_host_t *get_host_by_addr(uint8_t *addr, bool create, xbl_interface_t *in)
 
     xbl_host_t *h = NULL;
     pthread_mutex_lock(&host_hash.lock);
-    for (hash_node_t *n = host_hash.hosts[idx]; n != NULL; n = n->next) {
-        if (memcmp(addr, n->host->mac_addr, 6) == 0)
-            h = n->host;
+    for (xbl_host_t *n = host_hash.hosts[idx]; n != NULL; n = n->next) {
+        if (memcmp(addr, n->mac_addr, 6) == 0)
+            h = n;
             break;
     }
 
@@ -128,19 +133,9 @@ xbl_host_t *get_host_by_addr(uint8_t *addr, bool create, xbl_interface_t *in)
             bzero(h, sizeof(xbl_host_t));
             memcpy(h->mac_addr, addr, 6);
 
-            hash_node_t *n = malloc(sizeof(hash_node_t));
-            if (n != NULL) {
-                bzero(n, sizeof(hash_node_t));
-                n->host = h;
-                if (host_hash.hosts[idx] != NULL) {
-                    n->next = host_hash.hosts[idx];
-                }
-                host_hash.hosts[idx] = n;
-            } else {
-                log_ret("Failed to allocate xbl_node_t");
-                free(h);
-                h = NULL;
-            }
+            if (host_hash.hosts[idx] != NULL)
+                h->next = host_hash.hosts[idx];
+            host_hash.hosts[idx] = h;
         } else {
             log_ret("Failed to allocate xbl_host_t");
         }
@@ -148,8 +143,16 @@ xbl_host_t *get_host_by_addr(uint8_t *addr, bool create, xbl_interface_t *in)
     pthread_mutex_unlock(&host_hash.lock);
 
     if (h != NULL && in != NULL) {
-        if (h->interface != in)
+        if (h->interface != in) {
+            if (h->interface != NULL) {
+                pthread_mutex_lock(&format_mac_lock);
+                log_msg("Host %s moved from interface %s to %s",
+                        format_mac_address(h->mac_addr), h->interface->interface,
+                        in->interface);
+                pthread_mutex_unlock(&format_mac_lock);
+            }
             h->interface = in;
+        }
     }
 
     return h;
